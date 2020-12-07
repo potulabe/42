@@ -21,11 +21,11 @@ class gRNAfinder(object):
     def precount_gf(gf, output_text, PAM):
 
         input_text = os.path.join(genomes_db, "db_queries",
-                                  "{}_{}.precount.txt".format(genome_file.replace(os.sep, "_"), PAM))
+                                  "{}_{}.precount.txt".format(gf.replace(os.sep, "_"), PAM))
         grna_list = [PAM_grna_pattern, ]
         return run_cas_offinder(gf, grna_list, input_text, output_text, mismatch=0)
 
-    def __init__(self, PAM, genome_file=None, genome_file_precount=None):
+    def __init__(self, PAM, genome_file, genome_file_precount):
 
         self.genome_file = genome_file
         self.genome_file_precount = genome_file_precount
@@ -71,7 +71,7 @@ class gRNAfinder(object):
         :param gRNAlist:
         :return:
         """
-        genome_name = genome_file.replace(os.path.sep, "_").split(".")[0]
+        genome_name = self.genome_file.replace(os.path.sep, "_").split(".")[0]
         file_pref = "{genome_name}_{PAM}".format(
             genome_name=genome_name,
             PAM=PAM
@@ -81,15 +81,20 @@ class gRNAfinder(object):
         output_text = os.path.join("genomes_db", file_pref + ".txt")
 
         all_gRNAs = run_cas_offinder(self.genome_file, gRNAdf["PAM_gRNA"], input_text, output_text)
-        off_gRNAs = all_gRNAs[
-            ((all_gRNAs["fasta_ID"] != location["fasta_ID"]) |
-             (all_gRNAs["coord"] > location["end"]) |
-             (all_gRNAs["coord"] <= location["start"]))
-        ]
+
+        if not all_gRNAs.empty:
+            off_gRNAs = all_gRNAs[
+                ((all_gRNAs["fasta_ID"] != location["fasta_ID"]) |
+                 (all_gRNAs["coord"] > location["end"]) |
+                 (all_gRNAs["coord"] <= location["start"]))
+            ]
+        else:
+            off_gRNAs = all_gRNAs
 
         return off_gRNAs
 
-    def estimate_efficiency(self, guide_df, genome_fasta, location):
+    @staticmethod
+    def estimate_efficiency(guide_df, genome_fasta, location):
 
         input_data = []
 
@@ -136,15 +141,13 @@ def run_cas_offinder(genome_file, grna_list, input_text, output_text, mismatch=1
     """
 
     with open(input_text, "w") as input:
-        input.write("{}\n".format(
-            os.path.join(genomes_db, genome_file))
-        )
+        input.write("{}\n".format(genome_file))
         input.write("{}\n".format(PAM_grna_pattern))
 
         for grna in grna_list:
             input.write("{grna} {mm}\n".format(grna=grna, mm=mismatch))
 
-    subprocess.check_call(
+    ret = subprocess.check_call(
         [
             cas_offinder,
             input_text,
@@ -153,52 +156,87 @@ def run_cas_offinder(genome_file, grna_list, input_text, output_text, mismatch=1
         ]
     )
 
+    if ret != 0:
+        raise Exception("Cas-offinder returned non-zero status")
+
     if os.path.isfile(output_text):
         all_gRNAs = pd.read_csv(output_text, sep="\t", header=None)
         all_gRNAs = all_gRNAs.rename(columns=column_names)
-        return all_gRNAs
     else:
-        return pd.DataFrame(columns=column_names)
+        all_gRNAs = pd.DataFrame()
+        all_gRNAs = all_gRNAs.rename(columns=column_names)
 
+    return all_gRNAs
 
 def get_chromatin_dnase_data():
     raise NotImplementedError()
 
 
-if __name__ == "__main__":
-    genome_file = os.path.join("hg38", "chr1.fna")
-    genome_file_precount = "PAMS/{PAM}/hg38_chr1.txt".format(PAM=PAM)
+def do_finder(genome_fp, PAM, location, username):
+
+    genome_ID = "_".join(genome_fp.split(os.path.sep)[1:]).split(".")[0]
+    genome_file_precount = "PAMS/{PAM}/{g}.txt".format(PAM=PAM, g=genome_ID)
     genome_file_precount_path = os.path.join(genomes_db, genome_file_precount)
-    gf = gRNAfinder(PAM, genome_file=genome_file, genome_file_precount=genome_file_precount_path)
+
+    gf = gRNAfinder(PAM, genome_file=genome_fp, genome_file_precount=genome_file_precount_path)
+    our_gRNA = gf.findPAM(location)
+    off_gRNA = gf.findOffTagets(location, our_gRNA)
+
+    genome_fasta = SeqIO.parse(genome_fp, "fasta")
+
+    our_gRNA = gf.estimate_efficiency(our_gRNA, genome_fasta, location)
+    # off_gRNA = gf.estimate_efficiency(off_gRNA, genome_fasta)
+
+    # RESPONSE
+    # response_fasta_peace = os.path.join("response", username, "peace.fasta")
+    response_gRNA = os.path.join("response", username, "gRNA.tsv")
+    response_offtarget = os.path.join("response", username, "off_gRNA.tsv")
+
+    # with open(response_fasta_peace, "w") as f:
+    #     genome_fasta = SeqIO.parse(genome_fp, "fasta")
+    #     for seq_record in genome_fasta:
+    #         if seq_record.id == location["fasta_ID"].split()[0]:
+    #             f.write(">{}:{}-{}\n".format(location["fasta_ID"], location["start"], location["end"]))
+    #             f.write(str(seq_record.seq[location["start"]:location["end"]]))
+    #             break
+
+    try:
+        f = os.path.dirname(response_gRNA)
+        os.makedirs(f)
+    except Exception:
+        pass
+
+    our_gRNA.to_csv(response_gRNA, sep="\t", index=False, header=True)
+    off_gRNA.to_csv(response_offtarget, sep="\t", index=False, header=True)
+
+    return response_gRNA, response_offtarget
+
+
+def process_query(genome_fp, PAM, coords, username):
+    coords_parts = coords.split(":")
+    start_end = coords_parts[1].split("-")
+    start = int(start_end[0])
+    end = int(start_end[1])
+
+    location = {
+        "fasta_ID": coords_parts[0],  # "NC_000001.11 Homo sapiens chromosome 1, GRCh38.p13 Primary Assembly",
+        "start": start,
+        "end": end
+        # "end": 197146669
+    }
+
+    return do_finder(genome_fp, PAM, location, username)
+
+
+if __name__ == "__main__":
+    m_genome_file = os.path.join("genomes_db", "hg38", "chr1.fna")
 
     # ASPM chr1:197,084,127-197,146,669
-    location = {
-        "fasta_ID": "NC_000001.11 Homo sapiens chromosome 1, GRCh38.p13 Primary Assembly",
+    m_location = {
+        "fasta_ID": "chr1",  # "NC_000001.11 Homo sapiens chromosome 1, GRCh38.p13 Primary Assembly",
         "start": 197084127,
         "end": 197096669
         # "end": 197146669
     }
 
-    our_gRNA = gf.findPAM(location)
-    off_gRNA = gf.findOffTagets(location, our_gRNA)
-
-    genome_fasta = SeqIO.parse(os.path.join(genomes_db, genome_file), "fasta")
-
-    our_gRNA = gf.estimate_efficiency(our_gRNA, genome_fasta, location)
-    # off_gRNA = gf.estimate_efficiency(off_gRNA, genome_fasta)
-
-
-    # RESPONSE
-    response_fasta_peace = "response/peace.fasta"
-    response_gRNA = "response/gRNA.tsv"
-    response_offtarget = "response/off_gRNA.tsv"
-
-    with open(response_fasta_peace, "w") as f:
-        genome_fasta = SeqIO.parse(os.path.join(genomes_db, genome_file), "fasta")
-        for seq_record in genome_fasta:
-            if seq_record.id == location["fasta_ID"].split()[0]:
-                f.write(">{}:{}-{}\n".format(location["fasta_ID"], location["start"], location["end"]))
-                f.write(str(seq_record.seq[location["start"]:location["end"]]))
-                break
-    our_gRNA.to_csv(response_gRNA, sep="\t", index=False, header=True)
-    off_gRNA.to_csv(response_offtarget, sep="\t", index=False, header=True)
+    do_finder(m_genome_file, PAM, m_location, "default")
